@@ -31,7 +31,7 @@ class DTDMN(BaseModel):
 
         # build mode here
         # x is for discourse
-        self.x_encoder = module.MultiFC(self.vocab_size, args.hidden_size, args.d,
+        self.x_encoder = module.MultiFC(self.vocab_size, args.hidden_dim, args.d,
                                  num_hidden_layers=1, short_cut=True)
 
         self.x_generator = module.MultiFC(args.d, args.d, args.d,
@@ -40,10 +40,10 @@ class DTDMN(BaseModel):
 
         # context encoder
         # ctx is for topic
-        self.ctx_encoder = module.MultiFC(self.vocab_size, args.hidden_size, args.hidden_size,
+        self.ctx_encoder = module.MultiFC(self.vocab_size, args.hidden_dim, args.hidden_dim,
                                    num_hidden_layers=1, short_cut=True)
-        self.q_z_mu = nn.Linear(args.hidden_size, args.k)
-        self.q_z_logvar = nn.Linear(args.hidden_size, args.k)
+        self.q_z_mu = nn.Linear(args.hidden_dim, args.k)
+        self.q_z_logvar = nn.Linear(args.hidden_dim, args.k)
 
         
         self.ctx_generator = module.MultiFC(args.k, args.k, args.k, num_hidden_layers=0, short_cut=False)

@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from data import persuasiveDataset, persuasive_collate_fn
 from model.model import DTDMN
-from util.parameter import (add_default_args, add_model_args, add_optim_args, add_trainer_args, add_embed_args, add_dataset_args)
+from util.parameter import (add_default_args, add_model_args, add_optim_args, add_trainer_args, add_dataset_args)
 
 from util.loss import (hinge)
 import util.criterion as criterion
@@ -28,7 +28,6 @@ def parse_args():
     parser = add_model_args(parser)
     parser = add_optim_args(parser)
     parser = add_trainer_args(parser)
-    parser = add_embed_args(parser)
     parser = add_dataset_args(parser)
 
     args = parser.parse_args()
@@ -44,29 +43,28 @@ def check_seed(args):
     if(args.cuda):
         torch.cuda.manual_seed(args.seed)
 
-def build_data(args, persuasive_path):
+def build_data(args, persuasive_path, vocab):
     batch_size = args.batchsize
 
     # need to check
     num_worker=6
     persuasive = []
-    data_path, embed_path, pair_path = persuasive_path
+    data_path, pair_path = persuasive_path
     if(args.total):
         print('use full data to train')
-        temp = [('', '_all', True, batch_size), ('_dev', '_all', False, batch_size*4), ('_test', '_test', False, batch_size*4)]
+        temp = [('', '_train', True, batch_size), ('', '_dev', False, batch_size*4), ('_test', '_test', False, batch_size*4)]
     else:
-        temp = [('_train', '_all', True, batch_size), ('_dev', '_all', False, batch_size*4), ('_test', '_test', False, batch_size*4)]
+        temp = [('', '_train', True, batch_size), ('', '_dev', False, batch_size*4), ('_test', '_test', False, batch_size*4)]
 
-    for dtype, embtype, shuffle, b in temp:
-        dataset = persuasiveDataset(data_path=data_path+dtype, embed_path=embed_path+embtype, pair_path=pair_path+dtype, top=args.top, train=shuffle, direct=args.direct)
-        #dataset = persuasiveDataset(data_path=data_path+dtype, embed_path=embed_path+embtype, pair_path=pair_path+dtype, train=False)
+    for dtype, pair_type, shuffle, b in temp:
+        dataset = persuasiveDataset(data_path=data_path, pair_path=pair_path+pair_type, vocab=vocab['bow'], train=shuffle)
         dataloader = DataLoader(dataset, batch_size=b, shuffle=shuffle, num_workers=num_worker, collate_fn=persuasive_collate_fn)
         persuasive.append(dataloader)
     
     return persuasive
 
 def build_vocab(args):
-    return np.load(args.vocab)
+    return np.load(args.vocab).item()
 
 def convert(data, device):
     if(isinstance(data, dict)):
@@ -304,7 +302,7 @@ def main():
 
     # Load data
     persuasive_path = (args.data_path, args.pair_path)
-    persuasive = build_data(args, persuasive_path)
+    persuasive = build_data(args, persuasive_path, vocab)
 
     print('finish build data')
     # Train model
