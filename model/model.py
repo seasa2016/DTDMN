@@ -2,29 +2,61 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import model.module as module
+import sys
+import os
+import numpy as np
 
-class DTDMN(nn.Module):
+class DTDMN(BaseModel):
     def __init__(self, args):
+        super(DTDMN, self).__init__(args)
         self.args = args
-        self.word_emb = nn.Embedding(args.vocab_size, args.emb_dim)
+        # if pretrain embedding exist, load from npy file
+        if(os.path.isfile(args.pre)):
+            pretrain = np.load(args.pre)
+            args.vocab_size, args.emb_dim = pretrain.shape
+            self.word_emb = nn.Embedding(args.vocab_size, args.emb_dim, padding_idx=0)
+            self.word_emb.weight.data = torch.tensor(pretrain)
+            self.word_emb.weight.data[0] = 0
+        else:
+            self.word_emb = nn.Embedding(args.vocab_size, args.emb_dim, padding_idx=0)
+
+        self.vocab_size = args.vocab_size
+
+        # sequence encoder
         self.word_encoder = module.gru(args.emb_dim, args.hidden_dim)
         self.word_drop = nn.Dropout(args.word_drop_rate)
 
         args.atten_in = args.hidden_dim
         self.attn = module.single_attention(args)
-        
-        # context encoder
-        # x is for discourse
-        self.x_encoder = nn.Linear(args.vocab_size, args.d)
 
+        # build mode here
+        # x is for discourse
+        self.x_encoder = module.MultiFC(self.vocab_size, args.hidden_size, args.d,
+                                 num_hidden_layers=1, short_cut=True)
+
+        self.x_generator = module.MultiFC(args.d, args.d, args.d,
+                                   num_hidden_layers=0, short_cut=False)
+        self.x_decoder = nn.Linear(args.d, self.vocab_size, bias=False)
+
+        # context encoder
         # ctx is for topic
-        self.ctx_encoder = nn.Linear(args.vocab_size, args.vae_hidden_dim)
-        self.q_z_mu = nn.Linear(args.vae_hidden_dim, args.k)
-        self.q_z_logvar = nn.Linear(args.vae_hidden_dim, args.k)
+        self.ctx_encoder = module.MultiFC(self.vocab_size, args.hidden_size, args.hidden_size,
+                                   num_hidden_layers=1, short_cut=True)
+        self.q_z_mu = nn.Linear(args.hidden_size, args.k)
+        self.q_z_logvar = nn.Linear(args.hidden_size, args.k)
+
+        
+        self.ctx_generator = module.MultiFC(args.k, args.k, args.k, num_hidden_layers=0, short_cut=False)
 
         # decoder
-        self.x_decoder = nn.Linear(args.d, self.vocab_size)
+        self.ctx_dec_connector = nn.Linear(args.k, args.k, bias=True)
+        self.x_dec_connector = nn.Linear(args.d, args.d, bias=True)
         self.ctx_decoder = nn.Linear(args.k, self.vocab_size)
+
+        self.decoder = nn.Linear(args.k + args.d, self.vocab_size, bias=False)
+
+        # connector
+        self.cat_connector = GumbelConnector()
 
         # memory 
         self.memory = nn.Parameter(torch.rand(args.d+args.k, args.memory_dim))
@@ -42,7 +74,16 @@ class DTDMN(nn.Module):
         sample_d = sample_d_multi.mean(0)
         d_ids = d_ids_multi.view(self.args.d_size, -1).transpose(0, 1)
 
-        return qd_logits, sample_d, d_ids
+        return module.Pack(qd_logits=qd_logits, sample_d=sample_d, d_ids=d_ids)
+
+    def pxy_forward(self, results):
+        gen_d = self.x_generator(results.sample_d)
+        x_out = self.x_decoder(gen_d)
+
+        results['gen_d'] = gen_d
+        results['x_out'] = x_out
+
+        return results
 
     def qzc_forward(self, ctx_utts):
         ctx_out = F.tanh(self.ctx_encoder(ctx_utts))
@@ -50,44 +91,24 @@ class DTDMN(nn.Module):
         z_logvar = self.q_z_logvar(ctx_out)
 
         sample_z = self.reparameterize(z_mu, z_logvar)
-        return sample_z, z_mu, z_logvar
+        return module.Pack(sample_z=sample_z, z_mu=z_mu, z_logvar=z_logvar)
 
-    def update_memory(self, sent_emb, memory_scale):
-        batchsize, _  = memory_scale.shape
-        dic_dim, memory_dim = self.memory.shape
+    def pcz_forward(self, results):
+        gen_c = self.ctx_generator(results.sample_z)
+        c_out = self.ctx_decoder(gen_c)
 
-        erase = self.eraser_layer(sent_emb).sigmoid()
-        update = self.update_layer(sent_emb).tanh()
+        results['gen_c'] = gen_c
+        results['c_out'] = c_out
 
-        memory = self.memory.repeat(batchsize, 1, 1)
+        return results
 
-        memory_scale = memory_scale.unsqueeze(-1).repeat(1, 1, memory_dim).view()
-        erase = erase.repeat(1, dic_dim).view(batchsize, dic_dim, memory_scale)
-        update = update.repeat(1, dic_dim).view(batchsize, dic_dim, memory_scale)
-
-        erase = erase*memory_scale
-        update = update*memory_scale
-        memory = memory*(1-erase)+update
-        
-        return memory
-
-    def trunc(outs, lengths):
-        start, end = 0, 0
-        
-        _, hidden_din = outs.shape
-        device = outs.device
-        max_len = lengths.max().item()
-
-        temp = []
-        for l in lengths:
-            end += l
-            temp.append(
-                torch.cat(
-                    [outs[start:end], torch.zeros(max_len-l, hidden_din).to(device)], dim=-1
-                )
-            )
-            start = end
-        return torch.stack(temp)
+    def reparameterize(self, mu, logvar):
+        if self.training:
+            std = torch.exp(0.5*logvar)
+            eps = torch.randn_like(std)
+            return eps.mul(std).add_(mu)
+        else:
+            return mu
 
     def forward(self, word_id, sent_bow, sent_lens, turn_lens):
         # initial
@@ -98,22 +119,19 @@ class DTDMN(nn.Module):
         word_emb = self.word_encoder(word_emb, sent_lens)
         sent_emb = self.attn(word_emb)
 
-        # topic vae part
-        # discourse
-        qd_logits, sample_d, d_ids = self.qdx_forward(sent_bow)
-        vae_d_resp = self.x_decoder(sample_d)
-
-        # topic
-        sample_t, t_mu, t_logvar = self.qzc_forward(sent_bow)
-        vae_t_resp = self.ctx_decoder(sample_t.softmax(-1))
+        # vae here
+        vae_d_resp = self.pxy_forward(self.qdx_forward(sent_bow))
+        vae_t_resp = self.pcz_forward(self.qzc_forward(sent_bow))
 
         # prior network (we can restrict the prior to stopwords and emotional words)
+
         # combine context topic and x discourse
-        sample_d, d_ids = sample_d.detach(), d_ids.detach()
-        sample_t = sample_t.detach()
-        memory_scale = torch.cat([sample_d, sample_t], dim=1)
-        
-        recon = vae_d_resp+vae_t_resp
+        sample_d, d_ids = vae_d_resp.sample_d.detach(), vae_d_resp.d_ids.detach()
+        sample_z = vae_t_resp.sample_z.detach()
+        memory_scale = torch.cat([sample_d, sample_z], dim=1)
+
+        gen = torch.cat([self.x_dec_connector(sample_d), self.ctx_dec_connector(sample_z)], dim=1)
+        dec_out = self.decoder(gen)
 
         # sentence encode part
         memory = self.update_memory(sent_emb, memory_scale)
@@ -125,8 +143,8 @@ class DTDMN(nn.Module):
 
         last = torch.stack([ out[l-1]   for out, l in zip(outs, turn_lens)])
         score = self.fc(last)
-        
-        return recon, score
+
+        return vae_d_resp, vae_t_resp, dec_out,score
 
 class GumbelConnector(nn.Module):
     def __init__(self):
