@@ -19,23 +19,16 @@ class persuasiveDataset(Dataset):
             self.data = torch.load(total_path)
         else:
             with open(data_path) as f:
-                data = json.loads(f.readline())
-                self.data = {}
-                for pair_id, pair in data.items():
-                    
-                    bow = torch.zeros(self.vocab_len)
-                    for _ in pair['op_info']['word_id']:
-                        bow[_] = 1
-                    pair['op_info']['bow'] = bow
-
-                    for side in range(2):
-                        for path_id in range(len(pair['content'][side])):
-                            for reply_id in range(len(pair['content'][side][path_id])):
-                                bow = torch.zeros(self.vocab_len)
-                                for _ in pair['content'][side][path_id][reply_id]['word_id']:
-                                    bow[_] = 1
-                                pair['content'][side][path_id][reply_id]['bow'] = bow
-                    self.data[int(pair_id)] = pair
+                temp = json.loads(f.readline())
+            data = {}
+            for key, post in temp.items():
+                key = int(key)
+                data[key] = [{}, {}]
+                for side in range(2):
+                    for post_id, path in post[side].items():
+                        post_id = int(post_id)
+                        data[key][side][post_id] = path
+            self.data = data
             torch.save(self.data, total_path)
 
         with open(pair_path) as f:
@@ -72,18 +65,21 @@ class persuasiveDataset(Dataset):
         data_pair = []
 
         for side, post_index in enumerate([neg_post_index, pos_post_index]):
-            #print(self.data[index])
             sample = {
-                'word_id':[self.data[index]['op_info']['word_id']],
-                'sent_lens':[self.data[index]['op_info']['sent_lens']],
-                'bow':[self.data[index]['op_info']['bow']],
-                'turn_lens':len(self.data[index]['content'][side][post_index])+1
+                'word_id':[],
+                'sent_lens':[],
+                'bow':[],
+                'turn_lens':len(self.data[index][side][post_index]['content'])
             }
             
-            for _ in self.data[index]['content'][side][post_index]:
+            for _ in self.data[index][side][post_index]['content']:
                 sample['word_id'].append(_['word_id'])
                 sample['sent_lens'].append(_['sent_lens'])
-                sample['bow'].append(_['bow'])
+
+                bow = torch.zeros(self.vocab_len)
+                for word_id in _['word_id']:
+                    bow[word_id] = 1
+                sample['bow'].append(bow)
 
             data_pair.append(copy.deepcopy(sample))
         return data_pair
@@ -147,8 +143,8 @@ def persuasive_collate_fn(src):
 
 
 if(__name__ == '__main__'):
-    data_path = '/nfs/nas-5.1/kyhuang/preprocess/cmv_raw_origin_full_final/train/baseline/data'
-    pair_path = '/nfs/nas-5.1/kyhuang/preprocess/cmv_raw_origin_full_final/train/baseline/graph_pair'
+    data_path = '/nfs/nas-5.1/kyhuang/preprocess/cmv_raw_origin_full_final/baseline/data'
+    pair_path = '/nfs/nas-5.1/kyhuang/preprocess/cmv_raw_origin_full_final/tree/train_3/graph_pair_train'
     vocab = np.load('/nfs/nas-5.1/kyhuang/preprocess/cmv_raw_origin_full_final/baseline/vocab.npy', allow_pickle=True).item()
     
     dataloader = persuasiveDataset(data_path=data_path, pair_path=pair_path, vocab=vocab['bow'])

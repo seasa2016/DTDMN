@@ -80,9 +80,9 @@ class MultiFC(nn.Module):
         if self.num_hidden_layers == 0:
             out = self.fc(input_var)
         else:
-            x = F.tanh(self.fc_input(input_var))
+            x = self.fc_input(input_var).tanh()
             for i in range(1, self.num_hidden_layers):
-                x = F.tanh(self.fc_layers[i](x))
+                x = self.fc_layers[i](x).tanh()
             out = self.fc_output(x)
         if self.short_cut:
             out = out + self.es(input_var)

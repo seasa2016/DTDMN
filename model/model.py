@@ -6,27 +6,28 @@ import sys
 import os
 import numpy as np
 
-class DTDMN(BaseModel):
+class DTDMN(nn.Module):
     def __init__(self, args):
-        super(DTDMN, self).__init__(args)
+        super(DTDMN, self).__init__()
         self.args = args
         # if pretrain embedding exist, load from npy file
         if(os.path.isfile(args.pre)):
             pretrain = np.load(args.pre)
             args.vocab_size, args.emb_dim = pretrain.shape
             self.word_emb = nn.Embedding(args.vocab_size, args.emb_dim, padding_idx=0)
-            self.word_emb.weight.data = torch.tensor(pretrain)
-            self.word_emb.weight.data[0] = 0
+            self.word_emb.weight.data = torch.tensor(pretrain, dtype=torch.float)
+            self.word_emb.weight.data[0] = 0.
+            del pretrain
         else:
             self.word_emb = nn.Embedding(args.vocab_size, args.emb_dim, padding_idx=0)
-
+        #self.word_emb = nn.Embedding(args.vocab_size, args.emb_dim, padding_idx=0)
         self.vocab_size = args.vocab_size
 
         # sequence encoder
         self.word_encoder = module.gru(args.emb_dim, args.hidden_dim)
         self.word_drop = nn.Dropout(args.word_drop_rate)
 
-        args.atten_in = args.hidden_dim
+        args.atten_in = args.hidden_dim*2
         self.attn = module.single_attention(args)
 
         # build mode here
@@ -60,8 +61,8 @@ class DTDMN(BaseModel):
 
         # memory 
         self.memory = nn.Parameter(torch.rand(args.d+args.k, args.memory_dim))
-        self.eraser_layer = nn.Linear(args.hidden_dim, args.memory_dim)
-        self.update_layer = nn.Linear(args.hidden_dim, args.memory_dim)
+        self.eraser_layer = nn.Linear(args.hidden_dim*2, args.memory_dim)
+        self.update_layer = nn.Linear(args.hidden_dim*2, args.memory_dim)
 
         self.persuasive_pred = module.gru(args.memory_dim, args.memory_dim, bidirectional=False)
         self.fc = nn.Linear(args.memory_dim, 1, bias=False)
@@ -69,8 +70,7 @@ class DTDMN(BaseModel):
     def qdx_forward(self, tar_utts):
         qd_logits = self.x_encoder(tar_utts).view(-1, self.args.d)
         qd_logits_multi = qd_logits.repeat(self.args.d_size, 1, 1)
-        sample_d_multi, d_ids_multi = self.cat_connector(qd_logits_multi, 1.0,
-                                                         self.use_gpu, return_max_id=True)
+        sample_d_multi, d_ids_multi = self.cat_connector(qd_logits_multi, 1.0, return_max_id=True)
         sample_d = sample_d_multi.mean(0)
         d_ids = d_ids_multi.view(self.args.d_size, -1).transpose(0, 1)
 
@@ -86,7 +86,7 @@ class DTDMN(BaseModel):
         return results
 
     def qzc_forward(self, ctx_utts):
-        ctx_out = F.tanh(self.ctx_encoder(ctx_utts))
+        ctx_out = self.ctx_encoder(ctx_utts).tanh()
         z_mu = self.q_z_mu(ctx_out)
         z_logvar = self.q_z_logvar(ctx_out)
 
@@ -103,25 +103,58 @@ class DTDMN(BaseModel):
         return results
 
     def reparameterize(self, mu, logvar):
-        if self.training:
+        if(self.training):
             std = torch.exp(0.5*logvar)
             eps = torch.randn_like(std)
             return eps.mul(std).add_(mu)
         else:
             return mu
+    def update_memory(self, sent_emb, memory_scale):
+        erase = self.eraser_layer(sent_emb).sigmoid()
+        update = self.update_layer(sent_emb).tanh()
+        
+        batchsize, memory_dim = erase.shape
+        batchsize, num_memory = memory_scale.shape
 
-    def forward(self, word_id, sent_bow, sent_lens, turn_lens):
+        memory = self.memory.repeat(batchsize, 1, 1)
+        
+        erase = erase.repeat(1, num_memory).view(batchsize, num_memory, memory_dim)
+        update = update.repeat(1, num_memory).view(batchsize, num_memory, memory_dim)
+        memory_scale = memory_scale.unsqueeze(-1).repeat(1, 1, memory_dim).view(batchsize, num_memory, memory_dim)
+
+        memory = memory*(1-memory_scale*erase)+update
+        return memory
+    def trunc(self, outs, turn_lens):
+        device = outs.device
+        _, hidden_dim = outs.shape
+
+        temp = []
+        start, end = 0, 0
+        max_len = turn_lens.max().item()
+        
+        for l in turn_lens:
+            l = l.item()
+            end+=l
+            temp.append(
+                torch.cat([outs[start:end], torch.zeros(max_len-l, hidden_dim).to(device)], dim=0)
+            )
+            
+            start = end
+        
+        return torch.stack(temp)
+    def forward(self, word_id, bow, sent_lens, turn_lens):
         # initial
         device = word_id.device
 
         # sequence encoder
         word_emb = self.word_emb(word_id)
-        word_emb = self.word_encoder(word_emb, sent_lens)
-        sent_emb = self.attn(word_emb)
+        
+        word_emb, _ = self.word_encoder(word_emb, sent_lens)
+        sent_emb = self.attn.length_extract(word_emb, sent_lens)
 
         # vae here
-        vae_d_resp = self.pxy_forward(self.qdx_forward(sent_bow))
-        vae_t_resp = self.pcz_forward(self.qzc_forward(sent_bow))
+        vae_d_resp = self.pxy_forward(self.qdx_forward(bow))
+        vae_t_resp = self.pcz_forward(self.qzc_forward(bow))
 
         # prior network (we can restrict the prior to stopwords and emotional words)
 
@@ -144,25 +177,26 @@ class DTDMN(BaseModel):
         last = torch.stack([ out[l-1]   for out, l in zip(outs, turn_lens)])
         score = self.fc(last)
 
-        return vae_d_resp, vae_t_resp, dec_out,score
+        return vae_d_resp, vae_t_resp, dec_out, score
 
 class GumbelConnector(nn.Module):
     def __init__(self):
         super(GumbelConnector, self).__init__()
 
-    def sample_gumbel(self, logits, use_gpu, eps=1e-20):
+    def sample_gumbel(self, logits, eps=1e-20):
+        device = logits.device
         u = torch.rand(logits.size())
-        sample = Variable(-torch.log(-torch.log(u + eps) + eps))
-        sample = cast_type(sample, FLOAT, use_gpu)
+        sample = -torch.log(-torch.log(u + eps) + eps).to(device)
+        
         return sample
 
-    def gumbel_softmax_sample(self, logits, temperature, use_gpu):
+    def gumbel_softmax_sample(self, logits, temperature):
         """ Draw a sample from the Gumbel-Softmax distribution"""
-        eps = self.sample_gumbel(logits, use_gpu)
+        eps = self.sample_gumbel(logits)
         y = logits + eps
         return F.softmax(y / temperature, dim=y.dim()-1)
 
-    def forward(self, logits, temperature, use_gpu, hard=False,
+    def forward(self, logits, temperature, hard=False,
                 return_max_id=False):
         """
         :param logits: [batch_size, n_class] unnormalized log-prob
@@ -170,10 +204,12 @@ class GumbelConnector(nn.Module):
         :param hard: if True take argmax
         :return: [batch_size, n_class] sample from gumbel softmax
         """
-        y = self.gumbel_softmax_sample(logits, temperature, use_gpu)
+        device = logits.device
+
+        y = self.gumbel_softmax_sample(logits, temperature)
         _, y_hard = torch.max(y, dim=-1, keepdim=True)
         if hard:
-            y_onehot = cast_type(Variable(torch.zeros(y.size())), FLOAT, use_gpu)
+            y_onehot = torch.zeros(y.size(), dtype=torch.float).to(device)
             y_onehot.scatter_(-1, y_hard, 1.0)
             y = y_onehot
         if return_max_id:

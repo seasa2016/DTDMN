@@ -13,13 +13,13 @@ import torch.nn.utils as utils
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from data import persuasiveDataset, persuasive_collate_fn
+from data.dataloader import persuasiveDataset, persuasive_collate_fn
 from model.model import DTDMN
 from util.parameter import (add_default_args, add_model_args, add_optim_args, add_trainer_args, add_dataset_args)
 
 from util.loss import (hinge)
-import util.criterion as criterion
-from optim import RAdam, Ranger
+import util.criterion as criterions
+#from optim import RAdam, Ranger
 
 
 def parse_args():
@@ -39,9 +39,9 @@ def check_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
-    if(args.cuda):
-        torch.cuda.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.cuda.manual_seed(args.seed)
 
 def build_data(args, persuasive_path, vocab):
     batch_size = args.batchsize
@@ -57,14 +57,16 @@ def build_data(args, persuasive_path, vocab):
         temp = [('', '_train', True, batch_size), ('', '_dev', False, batch_size*4), ('_test', '_test', False, batch_size*4)]
 
     for dtype, pair_type, shuffle, b in temp:
-        dataset = persuasiveDataset(data_path=data_path, pair_path=pair_path+pair_type, vocab=vocab['bow'], train=shuffle)
+        dataset = persuasiveDataset(data_path=data_path+dtype, pair_path=pair_path+pair_type, vocab=vocab['bow'], train=False)
         dataloader = DataLoader(dataset, batch_size=b, shuffle=shuffle, num_workers=num_worker, collate_fn=persuasive_collate_fn)
         persuasive.append(dataloader)
     
     return persuasive
 
 def build_vocab(args):
-    return np.load(args.vocab).item()
+    vocab = np.load(args.vocab, allow_pickle=True).item()
+    args.vocab_size = len(vocab)
+    return vocab
 
 def convert(data, device):
     if(isinstance(data, dict)):
@@ -88,13 +90,13 @@ def update(buffer=None, in_data=None, out_data=None, criterion=None, alpha=0, dt
             temp['qd'].append(vae_d_resp.x_out.softmax(-1).cpu())
             temp['qt'].append(vae_t_resp.c_out.softmax(-1).cpu())
             temp['qd_logits'].append(vae_d_resp.qd_logits.softmax(-1).cpu())
-            temp['sent_bow'].append( in_data[i]['sent_bow'].cpu() )
-            temp['t_mu'].append(vae_t_resp.z_mu.view(-1).cpu())
-            temp['t_logvar'].append(vae_t_resp.z_logvar.view(-1).cpu())
+            temp['bow'].append( in_data[i]['bow'].cpu() )
+            temp['t_mu'].append(vae_t_resp.z_mu.cpu())
+            temp['t_logvar'].append(vae_t_resp.z_logvar.cpu())
 
         temp['persuasive'].append( (out_data[1][-1]-out_data[0][-1]).cpu().view(-1) )
 
-        for key in ['recon', 't_mu', 't_logvar', 'qd', 'qt', 'qd_logits', 'sent_bow', 'persuasive']:
+        for key in ['recon', 't_mu', 't_logvar', 'qd', 'qt', 'qd_logits', 'bow', 'persuasive']:
             for _ in temp[key]:
                 buffer[key].append(_.detach().cpu())
 
@@ -105,18 +107,19 @@ def update(buffer=None, in_data=None, out_data=None, criterion=None, alpha=0, dt
     if(dtype=='stat'):
         temp = buffer
     
-    sent_bow = torch.cat(temp['sent_bow'], dim=0)
-    batch_size = sent_bow.shape[0]
+    sent_bow = torch.cat(temp['bow'], dim=0)
+    
 
     # vae_d_kl
     qd_logits = torch.cat(temp['qd_logits'], dim=0)
-    avd_log_qd_logits = torch.log(torch.mean(qd_logits.mean(0), dim=0) + 1e-15)
-    log_uniform_d = (torch.ones(1) / avd_log_qd_logits.shape[-1]).log()
-    vae_d_kl = criterion['cat_kl_loss'](avg_log_qd, log_uniform_d, batch_size, unit_average=True)
+    batch_size = qd_logits.shape[0]
+    avg_log_qd_logits = torch.log(qd_logits.mean(0) + 1e-15)
+    log_uniform_d = (torch.ones(1) / avg_log_qd_logits.shape[-1]).log()
+    vae_d_kl = criterion['cat_kl_loss'](avg_log_qd_logits, log_uniform_d, batch_size, unit_average=True)
 
     # vae_t_kl
-    t_mu = torch.cat(temp['t_mu'], dim=-1)
-    t_logvar = torch.cat(temp['t_logvar'], dim=-1)
+    t_mu = torch.cat(temp['t_mu'], dim=0)
+    t_logvar = torch.cat(temp['t_logvar'], dim=0)
     vae_t_kl = criterion['kl_loss'](t_mu, t_logvar, batch_size, unit_average=True)
 
     # gen loss
@@ -150,10 +153,10 @@ def update(buffer=None, in_data=None, out_data=None, criterion=None, alpha=0, dt
             'vae_t_nll':vae_t_nll,
             'div_kl':div_kl,
             'dec_nll':dec_nll
-        }
+        },  
         'persuasive':{
             'per_loss':per_loss,
-            'acc':(persuasive>0).float().mean()
+            'acc':(persuasive>0).float().mean(),
             'diff':persuasive.mean()
         }
     }
@@ -162,7 +165,7 @@ def update(buffer=None, in_data=None, out_data=None, criterion=None, alpha=0, dt
 
     
 
-def train(args, persuasive_data_iter, model, criterion, device, multitask=False):
+def train(args, persuasive_data_iter, model, criterion, device):
     # initial for training 
     model.train()
     # build up optimizer
@@ -182,6 +185,7 @@ def train(args, persuasive_data_iter, model, criterion, device, multitask=False)
     accumulate = args.accumulate
     print_every = 100*accumulate
     eval_every = 25*accumulate
+    #print_every, eval_every = 1, 1
 
     total_epoch = args.epoch*len(persuasive_data_iter[0])
     print('total training step:', total_epoch)
@@ -208,7 +212,7 @@ def train(args, persuasive_data_iter, model, criterion, device, multitask=False)
             out = model(**data)
             outputs.append(out)
 
-        loss, stat = update(buffer=persuasive_preds, input=datas, out=outputs, criterion=criterion, alpha=alpha, dtype='loss')
+        loss, stat = update(buffer=persuasive_preds, in_data=datas, out_data=outputs, criterion=criterion, alpha=alpha, dtype='loss')
         loss.backward()
         
         if(count%accumulate==0):
@@ -223,7 +227,7 @@ def train(args, persuasive_data_iter, model, criterion, device, multitask=False)
             nt = time.time()
             print('now:{}, time: {:.4f}s'.format(count, nt - t))
             print('vae:', end=' ')
-            for key, val in stat['loss'].items():
+            for key, val in stat['vae'].items():
                 print('{}: {:.4f}'.format(key, val), end=' ')
             print('persuasive:', end=' ')
             for key, val in stat['persuasive'].items():
@@ -249,27 +253,36 @@ def test(epoch, persuasive_iter, model, criterion, device, alpha=[0, 0]):
     t = time.time()
 
     total_preds = collections.defaultdict(list)
+    batchsize= 0
+    pred = 0
     with torch.no_grad():
         for i, datas in enumerate(persuasive_iter):
             outputs = []
             for data in datas:
                 data = convert(data, device)
-                recon, out = model(**data)
-                outputs.append((recon, out))
-
-            update(buffer=total_preds, input=datas, out=outputs, dtype='update')
+                out = model(**data)
+                outputs.append(out)
+            pred += ((outputs[1][-1]-outputs[0][-1])>0).float().sum()
+            batchsize += outputs[1][-1].view(-1).shape[0]
+            #update(buffer=total_preds, in_data=datas, out_data=outputs, dtype='update')
+            #if(i==2):
+            #    break
+    acc = pred/batchsize
+    print('acc', acc.item())
+    return acc
     
+    """
     nt = time.time()
-    loss, stat = update(buffer=persuasive_preds, input=datas, out=outputs, criterion=criterion, alpha=alpha, dtype='update')
+    loss, stat = update(buffer=total_preds, criterion=criterion, alpha=alpha, dtype='stat')
     print(epoch,'time: {:.4f}s'.format(nt - t))
     print('vae:', end=' ')
-    for key, val in stat['loss'].items():
+    for key, val in stat['vae'].items():
         print('{}: {:.4f}'.format(key, val), end=' ')
     print('persuasive:', end=' ')
     for key, val in stat['persuasive'].items():
         print('{}: {:.4f}'.format(key, val), end=' ')
     print('', flush=True)
-    
+    """
     return stat['persuasive']['acc']
 
 def main():
@@ -280,6 +293,9 @@ def main():
         print('file exist', file=sys.stderr)
         #raise ValueError('file exist')
     check_seed(args)
+    
+    print('finish build vocab')
+    vocab = build_vocab(args)
 
 
     # Model and optimizer
@@ -297,8 +313,6 @@ def main():
     print('*'*10)
     
 
-    print('finish build vocab')
-    vocab = build_vocab(args)
 
     # Load data
     persuasive_path = (args.data_path, args.pair_path)
@@ -322,13 +336,13 @@ def main():
     criterion['kl_loss'] = criterions.GaussianKLLoss()
     criterion['cat_kl_loss'] = criterions.CatKLLoss()
         
-    train(args, persuasive, model, criterion, device, args.multitask)   
+    train(args, persuasive, model, criterion, device)   
     torch.save(model.state_dict(), args.save_path+'/check_last.pt')  
     print("Optimization Finished!")
     print('dev:')
-    test('End', persuasive[1], model, criterion, device, alpha= (args.ac_type_alpha, args.link_type_alpha))
+    test('End', persuasive[1], model, criterion, device, alpha= args.alpha)
     print('test:')
-    test('End', persuasive[2], model, criterion, device, alpha= (args.ac_type_alpha, args.link_type_alpha))
+    test('End', persuasive[2], model, criterion, device, alpha= args.alpha)
     print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
     # Testing
 
