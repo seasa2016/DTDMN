@@ -78,7 +78,7 @@ class persuasiveDataset(Dataset):
 
                 bow = torch.zeros(self.vocab_len)
                 for word_id in _['word_id']:
-                    bow[word_id] = 1
+                    bow[word_id] += 1
                 sample['bow'].append(bow)
 
             data_pair.append(copy.deepcopy(sample))
