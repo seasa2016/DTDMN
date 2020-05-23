@@ -239,8 +239,8 @@ def train(args, persuasive_data_iter, model, criterion, device):
             scheduler.step()
        
         if(count % print_every == 0):
-            dev_acc = test('dev {}'.format(count), persuasive_data_iter[1], model, criterion, device, alpha)
-            test_acc = test('test {}'.format(count), persuasive_data_iter[2], model, criterion, device, alpha)
+            dev_acc = test('dev {}'.format(count), persuasive_data_iter[1], model, criterion, device, alpha, save_path=save_path)
+            test_acc = test('test {}'.format(count), persuasive_data_iter[2], model, criterion, device, alpha, save_path=save_path)
             model.train()
             if(dev_acc>best_acc[0]):
                 best_acc = [dev_acc, test_acc]
@@ -248,13 +248,11 @@ def train(args, persuasive_data_iter, model, criterion, device):
     print('all finish with acc:', best_acc)
 
 
-def test(epoch, persuasive_iter, model, criterion, device, alpha=[0, 0]):
+def test(epoch, persuasive_iter, model, criterion, device, alpha=[0, 0], save_path=''):
     model.eval()
     t = time.time()
 
-    total_preds = collections.defaultdict(list)
-    batchsize= 0
-    pred = 0
+    total_preds = []
     with torch.no_grad():
         for i, datas in enumerate(persuasive_iter):
             outputs = []
@@ -262,14 +260,21 @@ def test(epoch, persuasive_iter, model, criterion, device, alpha=[0, 0]):
                 data = convert(data, device)
                 out = model(**data)
                 outputs.append(out)
-            pred += ((outputs[1][-1]-outputs[0][-1])>0).float().sum()
-            batchsize += outputs[1][-1].view(-1).shape[0]
-            #update(buffer=total_preds, in_data=datas, out_data=outputs, dtype='update')
-            #if(i==2):
-            #    break
-    acc = pred/batchsize
-    print('acc', acc.item())
-    return acc
+            
+            total_preds.append((outputs[1][-1]-outputs[0][-1]).view(-1))
+
+            #if(i==2):   break
+    total_preds = torch.cat(total_preds, dim=-1)
+    torch.save(total_preds, save_path+'{}.pt'.format(epoch))
+
+    stat = [criterion['persuasive'](total_preds, torch.ones_like(total_preds)), total_preds.mean(), (total_preds>0).float().mean()]
+    
+    nt = time.time()
+    print(epoch,'time: {:.4f}s'.format(nt - t),
+        '\npersuasive: [loss: {:.4f}, diff: {:.4f}, acc: {:.4f}]'.format(stat[0], stat[1], stat[2]),
+        flush=True)
+    
+    return stat[-1]
     
     """
     nt = time.time()
@@ -340,9 +345,9 @@ def main():
     torch.save(model.state_dict(), args.save_path+'/check_last.pt')  
     print("Optimization Finished!")
     print('dev:')
-    test('End', persuasive[1], model, criterion, device, alpha= args.alpha)
+    test('End', persuasive[1], model, criterion, device, alpha= args.alpha, save_path=args.save_path)
     print('test:')
-    test('End', persuasive[2], model, criterion, device, alpha= args.alpha)
+    test('End', persuasive[2], model, criterion, device, alpha= args.alpha, save_path=args.save_path)
     print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
     # Testing
 
